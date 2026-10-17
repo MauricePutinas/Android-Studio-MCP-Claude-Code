@@ -16,6 +16,7 @@ import asyncio
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -141,30 +142,17 @@ def _run_sync(
 ) -> CommandResult:
     norm = _normalize_args(args)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             norm,
             cwd=cwd,
             env=env,
-            timeout=timeout,
-            input=input_text,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-        )
-        out, t1 = _truncate(redact(proc.stdout or ""))
-        err, t2 = _truncate(redact(proc.stderr or ""))
-        return CommandResult(
-            args=list(norm), returncode=proc.returncode, stdout=out, stderr=err,
-            timed_out=False, truncated=t1 or t2, cwd=cwd,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out, _ = _truncate(redact(_to_text(exc.stdout)))
-        err, _ = _truncate(redact(_to_text(exc.stderr)))
-        return CommandResult(
-            args=list(norm), returncode=-1, stdout=out, stderr=err,
-            timed_out=True, truncated=True, cwd=cwd,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         )
     except FileNotFoundError as exc:
         return CommandResult(
@@ -172,6 +160,47 @@ def _run_sync(
             stderr=f"Executable not found: {exc}", timed_out=False,
             truncated=False, cwd=cwd,
         )
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def _pump(stream, sink):
+        try:
+            for line in iter(stream.readline, ""):
+                sink.append(line)
+        finally:
+            stream.close()
+
+    out_thread = threading.Thread(target=_pump, args=(proc.stdout, stdout_parts), daemon=True)
+    err_thread = threading.Thread(target=_pump, args=(proc.stderr, stderr_parts), daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        proc.wait()
+        out_thread.join()
+        err_thread.join()
+        out, t1 = _truncate(redact("".join(stdout_parts)))
+        err, t2 = _truncate(redact("".join(stderr_parts)))
+        return CommandResult(
+            args=list(norm), returncode=-1, stdout=out, stderr=err,
+            timed_out=True, truncated=t1 or t2, cwd=cwd,
+        )
+
+    out_thread.join()
+    err_thread.join()
+    out, t1 = _truncate(redact("".join(stdout_parts)))
+    err, t2 = _truncate(redact("".join(stderr_parts)))
+    return CommandResult(
+        args=list(norm), returncode=proc.returncode, stdout=out, stderr=err,
+        timed_out=False, truncated=t1 or t2, cwd=cwd,
+    )
 
 
 async def run(
